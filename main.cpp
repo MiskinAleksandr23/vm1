@@ -125,14 +125,13 @@ size_t calculateL1CacheSize(size_t lineSize, bool debug) {
     return 0;
 }
 
-double timeForL1Set(size_t cacheSize, size_t lineSize, size_t lines, bool sameSet) {
+double timeForL1Set(size_t cacheSize, size_t lines) {
     constexpr size_t kMaxCacheSize = 512 * 1024;
-    constexpr size_t kMaxLineSize = 1024;
     constexpr size_t kMaxLines = 34;
     constexpr size_t kIterations = 1 << 20;
-    alignas(4096) static size_t data[kMaxLines * (kMaxCacheSize + kMaxLineSize) / sizeof(size_t)];
+    alignas(4096) static size_t data[kMaxLines * kMaxCacheSize / sizeof(size_t)];
 
-    const size_t stride = (cacheSize + (sameSet ? 0 : lineSize)) / sizeof(size_t);
+    const size_t stride = cacheSize / sizeof(size_t);
     std::vector<size_t> positions(lines);
     std::iota(positions.begin(), positions.end(), 0);
     std::mt19937 rng(12345);
@@ -161,22 +160,17 @@ double timeForL1Set(size_t cacheSize, size_t lineSize, size_t lines, bool sameSe
     return timings[1];
 }
 
-size_t calculateL1Associativity(size_t cacheSize, size_t lineSize, bool debug) {
-    size_t slowMeasurements = 0;
+size_t calculateL1Associativity(size_t cacheSize, bool debug) {
+    double previousTime = 0;
     for (size_t lines = 2; lines <= 34; ++lines) {
-        const auto sameSet = timeForL1Set(cacheSize, lineSize, lines, true);
-        const auto control = timeForL1Set(cacheSize, lineSize, lines, false);
+        const double currentTime = timeForL1Set(cacheSize, lines);
         if (debug) {
-            std::println("L1 set lines = {}, same set = {} ns, control = {} ns", lines, sameSet, control);
+            std::println("L1 set lines = {}, time = {} ns/access", lines, currentTime);
         }
-
-        if (sameSet >= control * 1.5) {
-            if (++slowMeasurements == 2) {
-                return lines - 2;
-            }
-        } else {
-            slowMeasurements = 0;
+        if (previousTime > 0 && currentTime >= previousTime * 1.5) {
+            return lines - 1;
         }
+        previousTime = currentTime;
     }
     return 0;
 }
@@ -198,7 +192,7 @@ int main(int argc, char *argv[]) {
         const size_t l1Size = calculateL1CacheSize(lineSize, debug);
         if (l1Size != 0) {
             std::println("L1 data cache size = {} KiB", l1Size / 1024);
-            const size_t associativity = calculateL1Associativity(l1Size, lineSize, debug);
+            const size_t associativity = calculateL1Associativity(l1Size, debug);
             if (associativity != 0) {
                 std::println("L1 data cache associativity = {}", associativity);
             } else {
