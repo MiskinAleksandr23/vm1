@@ -114,7 +114,7 @@ size_t calculateL1CacheSize(size_t lineSize, bool debug) {
             slowMeasurements = 0;
             continue;
         }
-        if (nanoseconds >= fastestTime * 1.5) {
+        if (nanoseconds >= fastestTime * 1.45) {
             if (++slowMeasurements == 2) {
                 return bytes - 2 * kStep;
             }
@@ -167,7 +167,7 @@ size_t calculateL1Associativity(size_t cacheSize, bool debug) {
         if (debug) {
             std::println("L1 set lines = {}, time = {} ns/access", lines, currentTime);
         }
-        if (previousTime > 0 && currentTime >= previousTime * 1.5) {
+        if (previousTime > 0 && currentTime >= previousTime * 1.45) {
             return lines - 1;
         }
         previousTime = currentTime;
