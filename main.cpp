@@ -37,7 +37,7 @@ double timeForGivenPossibleCacheLineSize(size_t possibleCacheLineSize) {
   };
   vector<PairData> data((kThreadCount + 1) / 2);
   latch ready(kThreadCount), startSignal(1), finished(kThreadCount);
-  vector<jthread> threads;
+  vector<thread> threads;
   threads.reserve(kThreadCount);
   constexpr size_t kIterations = 1 << 25;
 
@@ -60,6 +60,8 @@ double timeForGivenPossibleCacheLineSize(size_t possibleCacheLineSize) {
   startSignal.count_down();
   finished.wait();
   const auto end = chrono::steady_clock::now();
+  for (auto &worker : threads)
+    worker.join();
   for (size_t t = 0; t < kThreadCount; ++t) {
     assert(
         data[t / 2].values[(t % 2) * possibleCacheLineSize / sizeof(size_t)] ==
