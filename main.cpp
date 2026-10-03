@@ -12,6 +12,7 @@
 #include <random>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace std;
@@ -24,11 +25,6 @@ double averageTime(Timings timings) {
   ranges::sort(timings);
   return accumulate(timings.begin() + 2, timings.end() - 2, 0.0) /
          (kRepeats - 4);
-}
-
-double averageFastTime(Timings timings) {
-  ranges::sort(timings);
-  return (timings[1] + timings[2] + timings[3]) / 3;
 }
 
 double timeForGivenPossibleCacheLineSize(size_t possibleCacheLineSize) {
@@ -203,18 +199,17 @@ size_t calculateL1CacheSize(size_t lineSize, bool debug) {
   return cacheSize;
 }
 
-double timeForL1Set(size_t cacheSize, size_t lines, size_t lineSize,
-                    unsigned seed, bool control) {
+double timeForL1Set(size_t stride, size_t lines, size_t lineSize, unsigned seed,
+                    bool control) {
   constexpr size_t kMaxCacheSize = 512 * 1024;
-  constexpr size_t kMaxLines = 34;
   constexpr size_t kBlockBytes = 4096;
   alignas(kBlockBytes) static size_t
-      data[kMaxLines * kMaxCacheSize / sizeof(size_t)];
-  const size_t linesPerBlock = kBlockBytes / lineSize;
+      data[(4 * kMaxCacheSize + kBlockBytes) / sizeof(size_t)];
+  const size_t linesPerBlock = min(stride, kBlockBytes) / lineSize;
   size_t lineInBlock = seed % linesPerBlock;
   vector<size_t> positions(lines);
   for (size_t i = 0; i < lines; ++i) {
-    positions[i] = (i * cacheSize + lineInBlock * lineSize) / sizeof(size_t);
+    positions[i] = (i * stride + lineInBlock * lineSize) / sizeof(size_t);
     if (control)
       lineInBlock = (lineInBlock + 1) % linesPerBlock;
   }
@@ -222,67 +217,120 @@ double timeForL1Set(size_t cacheSize, size_t lines, size_t lineSize,
 }
 
 size_t calculateL1Associativity(size_t cacheSize, size_t lineSize, bool debug) {
-  constexpr size_t kMaxLines = 34;
-  array<Timings, kMaxLines + 1> sameSet{}, control{};
-  vector<size_t> order(kMaxLines - 1);
-  iota(order.begin(), order.end(), 2);
-  mt19937 rng(12345);
+  vector<size_t> strides;
+  for (size_t stride = 2 * lineSize; stride <= 2 * cacheSize; stride *= 2)
+    if (2 * cacheSize % stride == 0)
+      strides.push_back(stride);
+  vector<Timings> sameSet(strides.size()), control(strides.size());
+  vector<size_t> order(strides.size());
+  iota(order.begin(), order.end(), 0);
+  mt19937 rng(1337);
+
+  auto measure = [&](size_t stride, size_t lines, unsigned seed,
+                     bool reverse) -> pair<double, double> {
+    double sameTime, controlTime;
+    if (reverse) {
+      controlTime = timeForL1Set(stride, lines, lineSize, seed, true);
+      sameTime = timeForL1Set(stride, lines, lineSize, seed, false);
+    } else {
+      sameTime = timeForL1Set(stride, lines, lineSize, seed, false);
+      controlTime = timeForL1Set(stride, lines, lineSize, seed, true);
+    }
+    return pair{sameTime, controlTime};
+  };
+
   for (size_t repeat = 0; repeat < kRepeats; ++repeat) {
     ranges::shuffle(order, rng);
-    for (size_t lines : order) {
-      const unsigned seed = rng();
-      if (repeat % 2 == 0) {
-        sameSet[lines][repeat] =
-            timeForL1Set(cacheSize, lines, lineSize, seed, false);
-        control[lines][repeat] =
-            timeForL1Set(cacheSize, lines, lineSize, seed, true);
-      } else {
-        control[lines][repeat] =
-            timeForL1Set(cacheSize, lines, lineSize, seed, true);
-        sameSet[lines][repeat] =
-            timeForL1Set(cacheSize, lines, lineSize, seed, false);
+    const unsigned seed = rng();
+    for (size_t i : order) {
+      const auto [a, b] =
+          measure(strides[i], 2 * cacheSize / strides[i], seed, repeat % 2);
+      sameSet[i][repeat] = a;
+      control[i][repeat] = b;
+    }
+  }
+  vector<Timings> differences(strides.size());
+  for (size_t i = 0; i < strides.size(); ++i) {
+    for (size_t r = 0; r < kRepeats; ++r)
+      differences[i][r] = sameSet[i][r] - control[i][r];
+    if (debug)
+      println("L1 stride = {} bytes, lines = {}, same set = {} ns, control = "
+              "{} ns, excess = {} ns",
+              strides[i], 2 * cacheSize / strides[i], averageTime(sameSet[i]),
+              averageTime(control[i]), averageTime(differences[i]));
+  }
+
+  const double hitTime = averageTime(control.back());
+  size_t associativity = 0;
+  for (size_t i = 1; i < strides.size(); ++i) {
+    Timings decreases;
+    size_t fasterRepeats = 0;
+    for (size_t r = 0; r < kRepeats; ++r) {
+      decreases[r] = differences[i - 1][r] - differences[i][r];
+      fasterRepeats += decreases[r] > 0;
+    }
+    if (averageTime(control[i - 1]) > hitTime * 1.25 ||
+        averageTime(differences[i - 1]) < hitTime * 0.05 ||
+        averageTime(decreases) < hitTime * 0.05 || fasterRepeats < 6) {
+      continue;
+    }
+    const size_t candidate = 2 * cacheSize / strides[i];
+
+    const array<size_t, 5> counts{candidate, candidate + 1, candidate,
+                                  candidate + 2, candidate};
+    array<unsigned, kRepeats> seeds;
+    for (auto &seed : seeds) {
+      seed = rng();
+    }
+    bool confirmed = true;
+    for (size_t stride : {strides[i] / 2, strides[i]}) {
+      array<Timings, 5> check{};
+      for (size_t repeat = 0; repeat < kRepeats; ++repeat) {
+        for (size_t j = 0; j < counts.size(); ++j) {
+          const auto [a, b] =
+              measure(stride, counts[j], seeds[repeat], repeat % 2);
+          check[j][repeat] = a - b;
+        }
+      }
+      Timings firstIncrease, secondIncrease;
+      for (size_t r = 0; r < kRepeats; ++r) {
+        firstIncrease[r] = check[1][r] - (check[0][r] + check[2][r]) / 2;
+        secondIncrease[r] = check[3][r] - (check[2][r] + check[4][r]) / 2;
+      }
+      auto meanAndError = [](const Timings &values) {
+        const double mean =
+            accumulate(values.begin(), values.end(), 0.0) / kRepeats;
+        double squaredError = 0;
+        for (double value : values)
+          squaredError += (value - mean) * (value - mean);
+        const double error =
+            3 * sqrt(squaredError / (kRepeats * (kRepeats - 1)));
+        return pair{mean, error};
+      };
+      const auto [firstMean, firstError] = meanAndError(firstIncrease);
+      const auto [secondMean, secondError] = meanAndError(secondIncrease);
+      if (debug) {
+        println("L1 candidate = {}, stride = {}, increase A+1 = {} ns "
+                "(3SE = {}), A+2 = {} ns (3SE = {})",
+                candidate, stride, firstMean, firstError, secondMean,
+                secondError);
+      }
+      if (firstMean <= firstError || secondMean <= secondError) {
+        confirmed = false;
+        break;
       }
     }
-  }
-  array<double, kMaxLines + 1> extraTime{};
-  for (size_t lines = 2; lines <= kMaxLines; ++lines) {
-    const double sameSetTime = averageFastTime(sameSet[lines]);
-    const double controlTime = averageFastTime(control[lines]);
-    extraTime[lines] = sameSetTime - controlTime;
-    if (debug)
-      println("L1 set lines = {}, same set = {} ns, control = {} ns", lines,
-              sameSetTime, controlTime);
-  }
-  size_t lastLines = kMaxLines;
-  const double minimumExtraTime = averageFastTime(sameSet[2]) * 0.15;
-  for (size_t lines = 4; lines <= kMaxLines; ++lines) {
-    if (extraTime[lines - 2] > minimumExtraTime &&
-        extraTime[lines - 1] > minimumExtraTime &&
-        extraTime[lines] > minimumExtraTime) {
-      lastLines = lines;
-      break;
-    }
-  }
-  size_t associativity = 0;
-  double greatestIncrease = 0;
-  for (size_t lines = 3; lines <= lastLines; ++lines) {
-    const double increase = extraTime[lines] - extraTime[lines - 1];
-    if (increase <= greatestIncrease ||
-        increase <= abs(extraTime[lines - 1]) * 0.05)
+    if (!confirmed) {
       continue;
-    if (lines < lastLines &&
-        extraTime[lines + 1] - extraTime[lines - 1] < increase / 2)
-      continue;
-    size_t slowerRepeats = 0;
-    for (size_t r = 0; r < kRepeats; ++r) {
-      const auto current = sameSet[lines][r] - control[lines][r];
-      const auto previous = sameSet[lines - 1][r] - control[lines - 1][r];
-      slowerRepeats += current > previous;
     }
-    if (slowerRepeats >= 6) {
-      greatestIncrease = increase;
-      associativity = lines - 1;
+    if (associativity != 0) {
+      if (debug) {
+        println("conflicting associativity: {} and {}", associativity,
+                candidate);
+      }
+      return 0;
     }
+    associativity = candidate;
   }
   return associativity;
 }
